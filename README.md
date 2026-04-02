@@ -2,6 +2,7 @@
 
 ### Requirements
 ##### UV (recommended)
+`sudo apt update && sudo apt install libxcb-cursor0`
 1. `curl -LsSf https://astral.sh/uv/install.sh | sh` or `wget -qO- https://astral.sh/uv/install.sh | sh` to install `uv`, skip if `uv` is ready for use.
 2. `uv sync` to install the requirements
 3. Set the `include-system-site-packages = true` in `pyvenv.cfg` under the `.venv` folder.
