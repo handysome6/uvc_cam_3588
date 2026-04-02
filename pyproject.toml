@@ -1,0 +1,9 @@
+[project]
+name = "uvc-cam-rk3588"
+version = "0.1.0"
+description = "Dual UVC camera preview and capture on RK3588"
+requires-python = ">=3.10"
+dependencies = [
+    "loguru>=0.7.3",
+    "pyside6==6.8.0.2",
+]
