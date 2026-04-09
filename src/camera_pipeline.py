@@ -533,6 +533,20 @@ class CameraPipeline(QObject):
     # Frame capture
     # ------------------------------------------------------------------
 
+    def snapshot_sample(self) -> "Gst.Sample | None":
+        """Atomically read and return the latest cached MJPEG sample.
+
+        Used by DualCameraManager to snapshot both cameras back-to-back
+        before scheduling any file writes, minimising the race window.
+        """
+        with self._sample_lock:
+            return self._latest_sample
+
+    def write_sample_to_file(self, sample: "Gst.Sample", path: str):
+        """Schedule a write of a pre-snapshot sample to *path* on a worker thread."""
+        logger.info("Capture queued → {}", path)
+        QThreadPool.globalInstance().start(_FrameWriter(sample, path))
+
     def capture_to_file(self, path: str) -> bool:
         """
         Schedule a write of the latest cached MJPEG frame to `path`.
@@ -540,15 +554,12 @@ class CameraPipeline(QObject):
         The write happens on QThreadPool (never blocks the UI thread).
         Returns True if a cached sample was available, False otherwise.
         """
-        with self._sample_lock:
-            sample = self._latest_sample
-
+        sample = self.snapshot_sample()
         if sample is None:
             logger.warning("capture_to_file: no cached sample available yet")
             return False
 
-        logger.info("Capture queued → {}", path)
-        QThreadPool.globalInstance().start(_FrameWriter(sample, path))
+        self.write_sample_to_file(sample, path)
         return True
 
     # ------------------------------------------------------------------

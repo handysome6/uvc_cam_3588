@@ -82,6 +82,10 @@ class DualCameraManager(QObject):
         Capture the latest frame from both cameras with a shared timestamp.
         Files are named based on canvas position: A_ (left) / D_ (right).
 
+        Samples are snapshot from both cameras back-to-back before any file
+        I/O to minimise the race window where one camera's cached frame could
+        be overwritten by the next trigger pulse.
+
         Args:
             directory: Output directory for captured files.
 
@@ -93,20 +97,32 @@ class DualCameraManager(QObject):
         ms = ts.microsecond // 1000
         ts_str = ts.strftime("%Y%m%d_%H%M%S_") + f"{ms:03d}"
 
+        # Phase 1: snapshot both samples back-to-back (microseconds apart)
+        # to avoid the race where one camera advances to the next frame
+        # while we are busy constructing paths / scheduling writes.
+        pipes: list[CameraPipeline | None] = [None, None]
+        samples = [None, None]
+        for canvas_pos in range(2):
+            pipe_idx = self._camera_mapping[canvas_pos]
+            pipe = self._pipelines[pipe_idx] if pipe_idx < len(self._pipelines) else None
+            pipes[canvas_pos] = pipe
+            if pipe is not None:
+                samples[canvas_pos] = pipe.snapshot_sample()
+
+        # Phase 2: schedule file writes for the snapshot samples
         results: list[str | None] = [None, None]
         prefixes = ["A", "D"]
         for canvas_pos in range(2):
             pipe_idx = self._camera_mapping[canvas_pos]
-            pipe = self._pipelines[pipe_idx] if pipe_idx < len(self._pipelines) else None
-            if pipe is None:
+            if samples[canvas_pos] is None:
+                if pipes[canvas_pos] is not None:
+                    logger.warning("Capture {} (cam{}): no frame cached", prefixes[canvas_pos], pipe_idx)
                 continue
             filename = f"{prefixes[canvas_pos]}_{ts_str}.jpg"
             path = os.path.join(directory, filename)
-            if pipe.capture_to_file(path):
-                results[canvas_pos] = path
-                logger.info("Capture {} (cam{}) → {}", prefixes[canvas_pos], pipe_idx, path)
-            else:
-                logger.warning("Capture {} (cam{}): no frame cached", prefixes[canvas_pos], pipe_idx)
+            pipes[canvas_pos].write_sample_to_file(samples[canvas_pos], path)
+            results[canvas_pos] = path
+            logger.info("Capture {} (cam{}) → {}", prefixes[canvas_pos], pipe_idx, path)
 
         return results
 
