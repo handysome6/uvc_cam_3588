@@ -578,3 +578,15 @@ class CameraPipeline(QObject):
     @property
     def use_overlay(self) -> bool:
         return self._use_overlay
+
+    @property
+    def base_time(self) -> int:
+        """Pipeline base_time in nanoseconds (0 if not playing).
+
+        v4l2src sets buffer.pts = v4l2_kernel_timestamp - base_time,
+        so adding base_time back recovers the original CLOCK_MONOTONIC
+        timestamp that is shared across all devices.
+        """
+        if self._pipeline is not None:
+            return self._pipeline.get_base_time()
+        return 0

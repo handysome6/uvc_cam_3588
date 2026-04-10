@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 # Data
 # ---------------------------------------------------------------------------
 
-_PAIR_RE = re.compile(r"^([AD])_(.+?)(\.\w+)$")
+_PAIR_RE = re.compile(r"^([AD])_(\d{8}_\d{6}_\d{3})(?:_(?:pts|ts)\d+)?(\.\w+)$")
 
 THUMB_W, THUMB_H = 120, 90
 

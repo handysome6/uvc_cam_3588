@@ -56,6 +56,11 @@ def main():
         action="store_true",
         help="Force appsink-to-QImage preview instead of VideoOverlay",
     )
+    parser.add_argument(
+        "--pts-filename",
+        action="store_true",
+        help="Include GStreamer buffer PTS in captured filenames for sync debugging",
+    )
     args = parser.parse_args()
 
     # Resolve device paths
@@ -84,7 +89,7 @@ def main():
     manager = DualCameraManager(devices=devices, use_overlay=use_overlay)
 
     logger.info("Launching MainWindow")
-    window = MainWindow(manager=manager)
+    window = MainWindow(manager=manager, pts_filename=args.pts_filename)
 
     # Safety net: also stop pipelines on any quit path that bypasses closeEvent
     app.aboutToQuit.connect(manager.stop)

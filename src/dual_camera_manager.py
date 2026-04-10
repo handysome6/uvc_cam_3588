@@ -8,6 +8,9 @@ a shared timestamp across both cameras.
 import os
 from datetime import datetime
 
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
 from loguru import logger
 from PySide6.QtCore import QObject, Signal
 
@@ -77,7 +80,7 @@ class DualCameraManager(QObject):
                 pipe.stop()
         logger.info("DualCameraManager: all pipelines stopped")
 
-    def capture(self, directory: str) -> list[str | None]:
+    def capture(self, directory: str, pts_in_filename: bool = False) -> list[str | None]:
         """
         Capture the latest frame from both cameras with a shared timestamp.
         Files are named based on canvas position: A_ (left) / D_ (right).
@@ -88,6 +91,8 @@ class DualCameraManager(QObject):
 
         Args:
             directory: Output directory for captured files.
+            pts_in_filename: If True, append the GStreamer buffer PTS
+                             (nanoseconds) to each filename for sync debugging.
 
         Returns:
             [path_left, path_right] — saved file path, or None if capture failed.
@@ -100,14 +105,26 @@ class DualCameraManager(QObject):
         # Phase 1: snapshot both samples back-to-back (microseconds apart)
         # to avoid the race where one camera advances to the next frame
         # while we are busy constructing paths / scheduling writes.
+        #
+        # Also recover absolute v4l2 kernel timestamps (CLOCK_MONOTONIC):
+        #   absolute_ts = buffer.pts + pipeline.base_time
+        # GStreamer's v4l2src stores:
+        #   buffer.pts = v4l2_kernel_timestamp − pipeline.base_time
+        # so adding base_time back gives a clock shared across all devices,
+        # allowing cross-camera frame-pair comparison.
         pipes: list[CameraPipeline | None] = [None, None]
         samples = [None, None]
+        v4l2_ts: list[int | None] = [None, None]
         for canvas_pos in range(2):
             pipe_idx = self._camera_mapping[canvas_pos]
             pipe = self._pipelines[pipe_idx] if pipe_idx < len(self._pipelines) else None
             pipes[canvas_pos] = pipe
             if pipe is not None:
                 samples[canvas_pos] = pipe.snapshot_sample()
+                if samples[canvas_pos] is not None:
+                    buf_pts = samples[canvas_pos].get_buffer().pts
+                    if buf_pts != Gst.CLOCK_TIME_NONE:
+                        v4l2_ts[canvas_pos] = buf_pts + pipe.base_time
 
         # Phase 2: schedule file writes for the snapshot samples
         results: list[str | None] = [None, None]
@@ -118,7 +135,8 @@ class DualCameraManager(QObject):
                 if pipes[canvas_pos] is not None:
                     logger.warning("Capture {} (cam{}): no frame cached", prefixes[canvas_pos], pipe_idx)
                 continue
-            filename = f"{prefixes[canvas_pos]}_{ts_str}.jpg"
+            ts_suffix = f"_ts{v4l2_ts[canvas_pos]}" if pts_in_filename and v4l2_ts[canvas_pos] is not None else ""
+            filename = f"{prefixes[canvas_pos]}_{ts_str}{ts_suffix}.jpg"
             path = os.path.join(directory, filename)
             pipes[canvas_pos].write_sample_to_file(samples[canvas_pos], path)
             results[canvas_pos] = path

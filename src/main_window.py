@@ -6,11 +6,12 @@ Layout:
   │   Left (A)       │   Right (D)      │
   │   (720p preview) │   (720p preview) │
   ├──────────────────┴──────────────────┤
-  │  [Capture] [Swap Cameras]           │
+  │  [Capture] [Auto] [Swap] [☑ PTS]   │
+  │  Save path: [~/captures___________] │
   │  Status: ...                        │
   └─────────────────────────────────────┘
 
-Capture files land in ~/captures/A_{YYYYMMDD}_{HHMMSS}_{mmm}.jpg (left)
+Capture files land in <save_path>/A_{YYYYMMDD}_{HHMMSS}_{mmm}.jpg (left)
                                   D_{YYYYMMDD}_{HHMMSS}_{mmm}.jpg (right)
 """
 
@@ -20,8 +21,10 @@ from loguru import logger
 from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QPixmap, QImage
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QSizePolicy,
@@ -32,7 +35,9 @@ from PySide6.QtWidgets import (
 from camera_pipeline import CameraPipeline
 from dual_camera_manager import DualCameraManager
 
-CAPTURE_DIR = os.path.expanduser("~/captures")
+DEFAULT_CAPTURE_DIR = os.path.expanduser("~/captures")
+AUTO_CAPTURE_COUNT = 20
+AUTO_CAPTURE_INTERVAL_MS = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +92,7 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         manager: DualCameraManager,
+        pts_filename: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -96,7 +102,11 @@ class MainWindow(QMainWindow):
         self._manager.camera_eos.connect(self._on_camera_eos)
         self._manager.cameras_swapped.connect(self._on_cameras_swapped)
 
-        os.makedirs(CAPTURE_DIR, exist_ok=True)
+        self._pts_default = pts_filename
+
+        # Auto-capture state
+        self._auto_timer: QTimer | None = None
+        self._auto_count: int = 0
 
         # Preview widgets: one per canvas position (may be _PreviewWidget or QLabel)
         self._previews: list[QWidget] = [None, None]
@@ -165,31 +175,63 @@ class MainWindow(QMainWindow):
         preview_root.addWidget(preview_row, stretch=1)
         root.addWidget(preview_container, stretch=1)
 
-        # Controls row
-        bar = QWidget()
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(0, 0, 0, 0)
-        bar_layout.setSpacing(8)
+        # Controls row 1 — buttons and options
+        row1 = QWidget()
+        row1_layout = QHBoxLayout(row1)
+        row1_layout.setContentsMargins(0, 0, 0, 0)
+        row1_layout.setSpacing(8)
 
         self._capture_btn = QPushButton("Capture")
         self._capture_btn.setMinimumHeight(36)
         self._capture_btn.setMinimumWidth(100)
         self._capture_btn.clicked.connect(self._on_capture)
 
+        self._auto_btn = QPushButton(f"Auto Capture ({AUTO_CAPTURE_COUNT})")
+        self._auto_btn.setMinimumHeight(36)
+        self._auto_btn.setMinimumWidth(140)
+        self._auto_btn.clicked.connect(self._on_auto_capture)
+
         self._swap_btn = QPushButton("Swap Cameras")
         self._swap_btn.setMinimumHeight(36)
         self._swap_btn.setMinimumWidth(120)
         self._swap_btn.clicked.connect(self._on_swap)
 
+        self._pts_cb = QCheckBox("PTS in filename")
+        self._pts_cb.setChecked(self._pts_default)
+
         self._status = QLabel("Starting pipelines…")
         self._status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
-        bar_layout.addWidget(self._capture_btn)
-        bar_layout.addWidget(self._swap_btn)
-        bar_layout.addWidget(self._status, stretch=1)
-        root.addWidget(bar)
+        row1_layout.addWidget(self._capture_btn)
+        row1_layout.addWidget(self._auto_btn)
+        row1_layout.addWidget(self._swap_btn)
+        row1_layout.addWidget(self._pts_cb)
+        row1_layout.addWidget(self._status, stretch=1)
+        root.addWidget(row1)
+
+        # Controls row 2 — save path
+        row2 = QWidget()
+        row2_layout = QHBoxLayout(row2)
+        row2_layout.setContentsMargins(0, 0, 0, 0)
+        row2_layout.setSpacing(8)
+
+        path_label = QLabel("Save path:")
+        self._path_edit = QLineEdit(DEFAULT_CAPTURE_DIR)
+        self._path_edit.setMinimumHeight(30)
+
+        row2_layout.addWidget(path_label)
+        row2_layout.addWidget(self._path_edit, stretch=1)
+        root.addWidget(row2)
 
         self.resize(1310, 810)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_capture_dir(self) -> str:
+        text = self._path_edit.text().strip()
+        return os.path.expanduser(text) if text else DEFAULT_CAPTURE_DIR
 
     # ------------------------------------------------------------------
     # Window lifecycle
@@ -219,16 +261,18 @@ class MainWindow(QMainWindow):
 
         started = sum(1 for r in results if r)
         if started > 0:
+            capture_dir = self._get_capture_dir()
             self._status.setText(
-                f"{started} camera(s) running — captures → {CAPTURE_DIR}"
+                f"{started} camera(s) running — captures → {capture_dir}"
             )
-            logger.success("{} pipeline(s) running | captures → {}", started, CAPTURE_DIR)
+            logger.success("{} pipeline(s) running | captures → {}", started, capture_dir)
         else:
             logger.error("No pipelines started")
             self._status.setText("Error: no cameras started")
 
     def closeEvent(self, event):
         logger.info("Window closing — stopping pipelines")
+        self._stop_auto_capture()
         self._manager.stop()
         super().closeEvent(event)
 
@@ -239,7 +283,9 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_capture(self):
         logger.info("Capture triggered")
-        paths = self._manager.capture(CAPTURE_DIR)
+        capture_dir = self._get_capture_dir()
+        pts = self._pts_cb.isChecked()
+        paths = self._manager.capture(capture_dir, pts_in_filename=pts)
 
         saved = [p for p in paths if p is not None]
         if saved:
@@ -255,6 +301,64 @@ class MainWindow(QMainWindow):
     @Slot()
     def _reset_capture_btn(self):
         self._capture_btn.setText("Capture")
+        self._capture_btn.setEnabled(True)
+
+    # ------------------------------------------------------------------
+    # Auto-capture
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_auto_capture(self):
+        if self._auto_timer is not None:
+            self._stop_auto_capture()
+            return
+
+        # Start auto-capture sequence
+        self._auto_count = 0
+        self._capture_btn.setEnabled(False)
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(AUTO_CAPTURE_INTERVAL_MS)
+        self._auto_timer.timeout.connect(self._auto_capture_tick)
+        self._auto_timer.start()
+
+        # Capture first frame immediately
+        self._auto_capture_tick()
+
+    @Slot()
+    def _auto_capture_tick(self):
+        self._auto_count += 1
+        capture_dir = self._get_capture_dir()
+        pts = self._pts_cb.isChecked()
+        paths = self._manager.capture(capture_dir, pts_in_filename=pts)
+
+        saved = [p for p in paths if p is not None]
+        if saved:
+            names = [os.path.basename(p) for p in saved]
+            self._status.setText(
+                f"Auto {self._auto_count}/{AUTO_CAPTURE_COUNT}: {', '.join(names)}"
+            )
+        else:
+            self._status.setText(
+                f"Auto {self._auto_count}/{AUTO_CAPTURE_COUNT}: no frame cached"
+            )
+
+        self._auto_btn.setText(
+            f"Stop Auto ({self._auto_count}/{AUTO_CAPTURE_COUNT})"
+        )
+
+        if self._auto_count >= AUTO_CAPTURE_COUNT:
+            self._stop_auto_capture()
+            self._status.setText(
+                f"Auto-capture complete — {AUTO_CAPTURE_COUNT} pairs saved to {capture_dir}"
+            )
+
+    def _stop_auto_capture(self):
+        if self._auto_timer is not None:
+            self._auto_timer.stop()
+            self._auto_timer.deleteLater()
+            self._auto_timer = None
+        self._auto_count = 0
+        self._auto_btn.setText(f"Auto Capture ({AUTO_CAPTURE_COUNT})")
         self._capture_btn.setEnabled(True)
 
     # ------------------------------------------------------------------
