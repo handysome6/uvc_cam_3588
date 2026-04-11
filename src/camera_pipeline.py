@@ -22,6 +22,9 @@ import glob
 import os
 import struct
 import threading
+import time
+from collections import deque
+from typing import NamedTuple
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -149,6 +152,21 @@ def _make_jpeg_probe(device: str):
 
 
 # ---------------------------------------------------------------------------
+# Timestamped sample for ring buffer
+# ---------------------------------------------------------------------------
+
+class StampedSample(NamedTuple):
+    """A GStreamer sample tagged with its wall-clock arrival time."""
+    arrival_ns: int       # time.clock_gettime_ns(CLOCK_MONOTONIC)
+    sample: object        # Gst.Sample (typed as object for NamedTuple compat)
+
+
+# Ring buffer depth: at 27 Hz this holds ~180 ms of history, enough to
+# cover the 1–2 frame USB delivery skew between cameras.
+RING_BUFFER_SIZE = 5
+
+
+# ---------------------------------------------------------------------------
 # File-write worker (runs on QThreadPool, never on the UI thread)
 # ---------------------------------------------------------------------------
 
@@ -223,8 +241,10 @@ class CameraPipeline(QObject):
         self._capture_sink: Gst.Element | None = None
         self._window_handle: int | None = None
 
-        # Latest MJPEG sample cache — updated on GStreamer streaming thread
-        self._latest_sample: Gst.Sample | None = None
+        # Ring buffer of recent MJPEG samples — updated on GStreamer streaming thread.
+        # Each entry is a StampedSample(arrival_ns, sample) so that
+        # DualCameraManager can match frames across cameras by wall-clock time.
+        self._sample_ring: deque[StampedSample] = deque(maxlen=RING_BUFFER_SIZE)
         self._sample_lock = threading.Lock()
 
         # State: "stopped" | "playing" | "error"
@@ -414,7 +434,7 @@ class CameraPipeline(QObject):
         self._preview_sink = None
         self._capture_sink = None
         with self._sample_lock:
-            self._latest_sample = None
+            self._sample_ring.clear()
         self._state = "stopped"
         QThreadPool.globalInstance().waitForDone(2000)
         logger.info("Pipeline stopped")
@@ -424,11 +444,12 @@ class CameraPipeline(QObject):
     # ------------------------------------------------------------------
 
     def _on_new_capture_sample(self, appsink: Gst.Element) -> Gst.FlowReturn:
-        """Cache latest MJPEG sample; called on GStreamer streaming thread."""
+        """Cache MJPEG sample with wall-clock timestamp; called on GStreamer streaming thread."""
         sample = appsink.emit("pull-sample")
         if sample is not None:
+            arrival = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
             with self._sample_lock:
-                self._latest_sample = sample
+                self._sample_ring.append(StampedSample(arrival, sample))
         return Gst.FlowReturn.OK
 
     # ------------------------------------------------------------------
@@ -548,7 +569,19 @@ class CameraPipeline(QObject):
         before scheduling any file writes, minimising the race window.
         """
         with self._sample_lock:
-            return self._latest_sample
+            return self._sample_ring[-1].sample if self._sample_ring else None
+
+    def snapshot_ring(self) -> list[StampedSample]:
+        """Return a snapshot of the ring buffer (list copy, newest last).
+
+        Each entry is a StampedSample(arrival_ns, sample) where arrival_ns
+        is CLOCK_MONOTONIC nanoseconds recorded when the frame arrived from
+        the USB host controller.  DualCameraManager uses these timestamps
+        to match frames across cameras — same-trigger frames arrive within
+        ~2 ms of each other regardless of trigger rate.
+        """
+        with self._sample_lock:
+            return list(self._sample_ring)
 
     def write_sample_to_file(self, sample: "Gst.Sample", path: str):
         """Schedule a write of a pre-snapshot sample to *path* on a worker thread."""

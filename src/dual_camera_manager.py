@@ -14,7 +14,7 @@ from gi.repository import Gst
 from loguru import logger
 from PySide6.QtCore import QObject, Signal
 
-from camera_pipeline import CameraPipeline
+from camera_pipeline import CameraPipeline, StampedSample
 
 
 class DualCameraManager(QObject):
@@ -93,16 +93,19 @@ class DualCameraManager(QObject):
 
     def capture(self, directory: str, pts_in_filename: bool = False) -> list[str | None]:
         """
-        Capture the latest frame from both cameras with a shared timestamp.
-        Files are named based on canvas position: A_ (left) / D_ (right).
+        Capture a timestamp-matched frame pair from both cameras.
 
-        Samples are snapshot from both cameras back-to-back before any file
-        I/O to minimise the race window where one camera's cached frame could
-        be overwritten by the next trigger pulse.
+        Instead of grabbing the single latest frame from each camera
+        (which may come from different trigger pulses due to USB delivery
+        skew), this method reads each camera's ring buffer of recent
+        wall-clock-stamped samples and selects the pair whose arrival
+        timestamps are closest — i.e. the pair from the same trigger pulse.
+
+        Files are named based on canvas position: A_ (left) / D_ (right).
 
         Args:
             directory: Output directory for captured files.
-            pts_in_filename: If True, append the GStreamer buffer PTS
+            pts_in_filename: If True, append the absolute v4l2 timestamp
                              (nanoseconds) to each filename for sync debugging.
 
         Returns:
@@ -113,31 +116,60 @@ class DualCameraManager(QObject):
         ms = ts.microsecond // 1000
         ts_str = ts.strftime("%Y%m%d_%H%M%S_") + f"{ms:03d}"
 
-        # Phase 1: snapshot both samples back-to-back (microseconds apart)
-        # to avoid the race where one camera advances to the next frame
-        # while we are busy constructing paths / scheduling writes.
-        #
-        # Also recover absolute v4l2 kernel timestamps (CLOCK_MONOTONIC):
-        #   absolute_ts = buffer.pts + pipeline.base_time
-        # GStreamer's v4l2src stores:
-        #   buffer.pts = v4l2_kernel_timestamp − pipeline.base_time
-        # so adding base_time back gives a clock shared across all devices,
-        # allowing cross-camera frame-pair comparison.
+        # Phase 1: snapshot ring buffers from both cameras
         pipes: list[CameraPipeline | None] = [None, None]
-        samples = [None, None]
-        v4l2_ts: list[int | None] = [None, None]
+        rings: list[list[StampedSample]] = [[], []]
         for canvas_pos in range(2):
             pipe_idx = self._camera_mapping[canvas_pos]
             pipe = self._pipelines[pipe_idx] if pipe_idx < len(self._pipelines) else None
             pipes[canvas_pos] = pipe
             if pipe is not None:
-                samples[canvas_pos] = pipe.snapshot_sample()
-                if samples[canvas_pos] is not None:
-                    buf_pts = samples[canvas_pos].get_buffer().pts
-                    if buf_pts != Gst.CLOCK_TIME_NONE:
-                        v4l2_ts[canvas_pos] = buf_pts + pipe.base_time
+                rings[canvas_pos] = pipe.snapshot_ring()
 
-        # Phase 2: schedule file writes for the snapshot samples
+        # Phase 2: match frames by closest wall-clock arrival timestamp
+        #
+        # Same-trigger frames arrive within ~2 ms of each other (measured
+        # across separate USB host controllers).  The ring holds the last
+        # N frames so even if one camera's streaming thread is 1-2 frames
+        # ahead, the matching frame from the other camera is still present.
+        samples: list[Gst.Sample | None] = [None, None]
+        match_delta_ms: float | None = None
+
+        if rings[0] and rings[1]:
+            best_delta = float('inf')
+            best_a: StampedSample | None = None
+            best_d: StampedSample | None = None
+            # O(N²) with N=5 — trivial cost
+            for a_entry in rings[0]:
+                for d_entry in rings[1]:
+                    delta = abs(a_entry.arrival_ns - d_entry.arrival_ns)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_a = a_entry
+                        best_d = d_entry
+
+            samples[0] = best_a.sample
+            samples[1] = best_d.sample
+            match_delta_ms = best_delta / 1_000_000
+            logger.info(
+                "Frame match: Δ={:.3f}ms (ring sizes: {} / {})",
+                match_delta_ms, len(rings[0]), len(rings[1]),
+            )
+        else:
+            # Fallback: only one camera has frames
+            for canvas_pos in range(2):
+                if rings[canvas_pos]:
+                    samples[canvas_pos] = rings[canvas_pos][-1].sample
+
+        # Phase 3: recover absolute v4l2 timestamps for filename suffix
+        v4l2_ts: list[int | None] = [None, None]
+        for canvas_pos in range(2):
+            if samples[canvas_pos] is not None and pipes[canvas_pos] is not None:
+                buf_pts = samples[canvas_pos].get_buffer().pts
+                if buf_pts != Gst.CLOCK_TIME_NONE:
+                    v4l2_ts[canvas_pos] = buf_pts + pipes[canvas_pos].base_time
+
+        # Phase 4: schedule file writes
         results: list[str | None] = [None, None]
         prefixes = ["A", "D"]
         for canvas_pos in range(2):
