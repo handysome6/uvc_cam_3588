@@ -22,6 +22,7 @@ from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QPixmap, QImage
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -196,6 +197,18 @@ class MainWindow(QMainWindow):
         self._swap_btn.setMinimumWidth(120)
         self._swap_btn.clicked.connect(self._on_swap)
 
+        self._fps_combo = QComboBox()
+        from camera_pipeline import CameraPipeline
+        for label in CameraPipeline.FRAMERATE_PRESETS:
+            self._fps_combo.addItem(label)
+        # Set initial selection to match current manager framerate
+        for i in range(self._fps_combo.count()):
+            label = self._fps_combo.itemText(i)
+            if CameraPipeline.FRAMERATE_PRESETS[label] == self._manager.framerate:
+                self._fps_combo.setCurrentIndex(i)
+                break
+        self._fps_combo.currentTextChanged.connect(self._on_framerate_changed)
+
         self._pts_cb = QCheckBox("PTS in filename")
         self._pts_cb.setChecked(self._pts_default)
 
@@ -205,6 +218,8 @@ class MainWindow(QMainWindow):
         row1_layout.addWidget(self._capture_btn)
         row1_layout.addWidget(self._auto_btn)
         row1_layout.addWidget(self._swap_btn)
+        row1_layout.addWidget(QLabel("FPS:"))
+        row1_layout.addWidget(self._fps_combo)
         row1_layout.addWidget(self._pts_cb)
         row1_layout.addWidget(self._status, stretch=1)
         root.addWidget(row1)
@@ -370,6 +385,37 @@ class MainWindow(QMainWindow):
         logger.info("Swap cameras triggered")
         self._manager.stop()
         self._manager.swap_cameras()
+
+    # ------------------------------------------------------------------
+    # Framerate change
+    # ------------------------------------------------------------------
+
+    @Slot(str)
+    def _on_framerate_changed(self, label: str):
+        from camera_pipeline import CameraPipeline
+        framerate = CameraPipeline.FRAMERATE_PRESETS.get(label)
+        if framerate is None or framerate == self._manager.framerate:
+            return
+        logger.info("Framerate changed to {} ({})", label, framerate)
+        self._stop_auto_capture()
+        self._manager.stop()
+        self._manager.set_framerate(framerate)
+        self._restart_pipelines()
+        self._status.setText(f"Framerate set to {label}")
+
+    def _restart_pipelines(self):
+        """Restart pipelines with current settings, reusing existing preview widgets."""
+        handles: list[int | None] = [None, None]
+        for canvas_pos in range(2):
+            widget = self._previews[canvas_pos]
+            if isinstance(widget, _PreviewWidget):
+                # Re-bind the _PreviewWidget to the new pipeline object
+                pipe = self._manager.pipeline_for_canvas(canvas_pos)
+                widget._pipeline = pipe
+                handles[canvas_pos] = int(widget.winId())
+        results = self._manager.start(handles)
+        started = sum(1 for r in results if r)
+        logger.info("{} pipeline(s) restarted", started)
 
     @Slot()
     def _on_cameras_swapped(self):

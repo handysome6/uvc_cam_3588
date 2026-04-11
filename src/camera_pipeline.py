@@ -198,15 +198,23 @@ class CameraPipeline(QObject):
     PREVIEW_W = 1280
     PREVIEW_H = 720
 
+    # Framerate presets: label -> GStreamer fraction string
+    FRAMERATE_PRESETS = {
+        "27 Hz": "55/2",
+        "10 Hz": "10/1",
+    }
+
     def __init__(
         self,
         device: str = "/dev/video0",
         use_overlay: bool = True,
+        framerate: str = "55/2",
         parent: QObject = None,
     ):
         super().__init__(parent)
         self._device = device
         self._use_overlay = use_overlay
+        self._framerate = framerate
         self._on_rk3588 = is_rk3588()
 
         # Runtime state
@@ -240,7 +248,7 @@ class CameraPipeline(QObject):
             # Framerate must be explicit — RK3588 v4l2src won't auto-negotiate.
             src = (
                 f"v4l2src device={self._device} io-mode=mmap ! "
-                "image/jpeg,width=5120,height=3840,framerate=55/2 ! "
+                f"image/jpeg,width=5120,height=3840,framerate={self._framerate} ! "
                 "tee name=t "
             )
             capture_branch = (
@@ -578,6 +586,10 @@ class CameraPipeline(QObject):
     @property
     def use_overlay(self) -> bool:
         return self._use_overlay
+
+    @property
+    def framerate(self) -> str:
+        return self._framerate
 
     @property
     def base_time(self) -> int:

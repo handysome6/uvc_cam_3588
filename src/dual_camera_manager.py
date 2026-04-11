@@ -35,23 +35,34 @@ class DualCameraManager(QObject):
         self,
         devices: list[str],
         use_overlay: bool = True,
+        framerate: str = "55/2",
         parent: QObject = None,
     ):
         super().__init__(parent)
+        self._devices = devices[:2]
         self._use_overlay = use_overlay
+        self._framerate = framerate
         self._pipelines: list[CameraPipeline | None] = [None, None]
         self._camera_mapping = [0, 1]  # maps canvas position to pipeline index
 
-        for i, dev in enumerate(devices[:2]):
-            pipe = CameraPipeline(device=dev, use_overlay=use_overlay, parent=self)
+        self._create_pipelines()
+
+        active = sum(1 for p in self._pipelines if p is not None)
+        logger.info("DualCameraManager: {}/2 cameras configured", active)
+
+    def _create_pipelines(self):
+        """Create CameraPipeline instances for each device."""
+        self._pipelines = [None, None]
+        for i, dev in enumerate(self._devices):
+            pipe = CameraPipeline(
+                device=dev, use_overlay=self._use_overlay,
+                framerate=self._framerate, parent=self,
+            )
             cam_index = i
             pipe.pipeline_error.connect(lambda msg, idx=cam_index: self.camera_error.emit(idx, msg))
             pipe.pipeline_eos.connect(lambda idx=cam_index: self.camera_eos.emit(idx))
             self._pipelines[i] = pipe
-            logger.info("DualCameraManager: cam{} → {}", i, dev)
-
-        active = sum(1 for p in self._pipelines if p is not None)
-        logger.info("DualCameraManager: {}/2 cameras configured", active)
+            logger.info("DualCameraManager: cam{} → {} @ {}", i, dev, self._framerate)
 
     def start(self, window_handles: list[int | None]) -> list[bool]:
         """
@@ -162,6 +173,16 @@ class DualCameraManager(QObject):
         self._camera_mapping.reverse()
         logger.info("DualCameraManager: cameras swapped, new mapping: {}", self._camera_mapping)
         self.cameras_swapped.emit()
+
+    def set_framerate(self, framerate: str):
+        """Change the capture framerate. Pipelines must be stopped and restarted by the caller."""
+        self._framerate = framerate
+        logger.info("DualCameraManager: framerate set to {}", framerate)
+        self._create_pipelines()
+
+    @property
+    def framerate(self) -> str:
+        return self._framerate
 
     @property
     def use_overlay(self) -> bool:
