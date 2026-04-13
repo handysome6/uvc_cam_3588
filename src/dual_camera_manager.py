@@ -8,9 +8,6 @@ a shared timestamp across both cameras.
 import os
 from datetime import datetime
 
-import gi
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst
 from loguru import logger
 from PySide6.QtCore import QObject, Signal
 
@@ -132,7 +129,7 @@ class DualCameraManager(QObject):
         # pad probe on v4l2src's streaming thread (before the tee fans out
         # to preview/capture branches).  No preview decode contention at
         # this point, so same-trigger frames have timestamps within ~1 ms.
-        samples: list[Gst.Sample | None] = [None, None]
+        matched: list[StampedSample | None] = [None, None]
         match_delta_ms: float | None = None
 
         if rings[0] and rings[1]:
@@ -148,8 +145,8 @@ class DualCameraManager(QObject):
                         best_a = a_entry
                         best_d = d_entry
 
-            samples[0] = best_a.sample
-            samples[1] = best_d.sample
+            matched[0] = best_a
+            matched[1] = best_d
             match_delta_ms = best_delta / 1_000_000
             logger.info(
                 "Frame match: Δ={:.3f}ms (ring sizes: {} / {})",
@@ -159,29 +156,21 @@ class DualCameraManager(QObject):
             # Fallback: only one camera has frames
             for canvas_pos in range(2):
                 if rings[canvas_pos]:
-                    samples[canvas_pos] = rings[canvas_pos][-1].sample
+                    matched[canvas_pos] = rings[canvas_pos][-1]
 
-        # Phase 3: recover absolute v4l2 timestamps for filename suffix
-        v4l2_ts: list[int | None] = [None, None]
-        for canvas_pos in range(2):
-            if samples[canvas_pos] is not None and pipes[canvas_pos] is not None:
-                buf_pts = samples[canvas_pos].get_buffer().pts
-                if buf_pts != Gst.CLOCK_TIME_NONE:
-                    v4l2_ts[canvas_pos] = buf_pts + pipes[canvas_pos].base_time
-
-        # Phase 4: schedule file writes
+        # Phase 3: schedule file writes
         results: list[str | None] = [None, None]
         prefixes = ["A", "D"]
         for canvas_pos in range(2):
             pipe_idx = self._camera_mapping[canvas_pos]
-            if samples[canvas_pos] is None:
+            if matched[canvas_pos] is None:
                 if pipes[canvas_pos] is not None:
                     logger.warning("Capture {} (cam{}): no frame cached", prefixes[canvas_pos], pipe_idx)
                 continue
-            ts_suffix = f"_ts{v4l2_ts[canvas_pos]}" if pts_in_filename and v4l2_ts[canvas_pos] is not None else ""
+            ts_suffix = f"_ts{matched[canvas_pos].timestamp_ns}" if pts_in_filename else ""
             filename = f"{prefixes[canvas_pos]}_{ts_str}{ts_suffix}.jpg"
             path = os.path.join(directory, filename)
-            pipes[canvas_pos].write_sample_to_file(samples[canvas_pos], path)
+            pipes[canvas_pos].write_sample_to_file(matched[canvas_pos].sample, path)
             results[canvas_pos] = path
             logger.info("Capture {} (cam{}) → {}", prefixes[canvas_pos], pipe_idx, path)
 
