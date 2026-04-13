@@ -126,12 +126,12 @@ class DualCameraManager(QObject):
             if pipe is not None:
                 rings[canvas_pos] = pipe.snapshot_ring()
 
-        # Phase 2: match frames by closest wall-clock arrival timestamp
+        # Phase 2: match frames by closest v4l2 kernel timestamp
         #
-        # Same-trigger frames arrive within ~2 ms of each other (measured
-        # across separate USB host controllers).  The ring holds the last
-        # N frames so even if one camera's streaming thread is 1-2 frames
-        # ahead, the matching frame from the other camera is still present.
+        # Each ring entry carries a CLOCK_MONOTONIC timestamp — preferably
+        # the v4l2 kernel timestamp (buffer.pts + base_time) which is immune
+        # to userspace scheduling jitter.  Same-trigger frames have kernel
+        # timestamps within ~1 ms regardless of GStreamer thread scheduling.
         samples: list[Gst.Sample | None] = [None, None]
         match_delta_ms: float | None = None
 
@@ -142,7 +142,7 @@ class DualCameraManager(QObject):
             # O(N²) with N=5 — trivial cost
             for a_entry in rings[0]:
                 for d_entry in rings[1]:
-                    delta = abs(a_entry.arrival_ns - d_entry.arrival_ns)
+                    delta = abs(a_entry.timestamp_ns - d_entry.timestamp_ns)
                     if delta < best_delta:
                         best_delta = delta
                         best_a = a_entry

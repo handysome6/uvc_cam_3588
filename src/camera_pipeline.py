@@ -156,8 +156,15 @@ def _make_jpeg_probe(device: str):
 # ---------------------------------------------------------------------------
 
 class StampedSample(NamedTuple):
-    """A GStreamer sample tagged with its wall-clock arrival time."""
-    arrival_ns: int       # time.clock_gettime_ns(CLOCK_MONOTONIC)
+    """A GStreamer sample tagged with a CLOCK_MONOTONIC timestamp for matching.
+
+    timestamp_ns is the best available CLOCK_MONOTONIC time for this frame:
+      - Preferred: v4l2 kernel timestamp (buffer.pts + pipeline.base_time),
+        stamped in kernel space, immune to userspace scheduling jitter.
+      - Fallback:  wall-clock arrival time (time.clock_gettime_ns), used only
+        when PTS is unavailable (CLOCK_TIME_NONE).
+    """
+    timestamp_ns: int     # CLOCK_MONOTONIC ns — v4l2 kernel ts preferred
     sample: object        # Gst.Sample (typed as object for NamedTuple compat)
 
 
@@ -242,8 +249,8 @@ class CameraPipeline(QObject):
         self._window_handle: int | None = None
 
         # Ring buffer of recent MJPEG samples — updated on GStreamer streaming thread.
-        # Each entry is a StampedSample(arrival_ns, sample) so that
-        # DualCameraManager can match frames across cameras by wall-clock time.
+        # Each entry is a StampedSample(timestamp_ns, sample) so that
+        # DualCameraManager can match frames across cameras by v4l2 kernel timestamp.
         self._sample_ring: deque[StampedSample] = deque(maxlen=RING_BUFFER_SIZE)
         self._sample_lock = threading.Lock()
 
@@ -444,12 +451,20 @@ class CameraPipeline(QObject):
     # ------------------------------------------------------------------
 
     def _on_new_capture_sample(self, appsink: Gst.Element) -> Gst.FlowReturn:
-        """Cache MJPEG sample with wall-clock timestamp; called on GStreamer streaming thread."""
+        """Cache MJPEG sample with v4l2 kernel timestamp; called on GStreamer streaming thread."""
         sample = appsink.emit("pull-sample")
         if sample is not None:
-            arrival = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+            buf = sample.get_buffer()
+            pts = buf.pts
+            # Prefer v4l2 kernel timestamp (CLOCK_MONOTONIC, stamped in kernel,
+            # immune to userspace scheduling jitter from preview decode threads).
+            # Fall back to wall-clock only if PTS is unavailable.
+            if pts != Gst.CLOCK_TIME_NONE and self._pipeline is not None:
+                ts = pts + self._pipeline.get_base_time()
+            else:
+                ts = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
             with self._sample_lock:
-                self._sample_ring.append(StampedSample(arrival, sample))
+                self._sample_ring.append(StampedSample(ts, sample))
         return Gst.FlowReturn.OK
 
     # ------------------------------------------------------------------
@@ -574,11 +589,11 @@ class CameraPipeline(QObject):
     def snapshot_ring(self) -> list[StampedSample]:
         """Return a snapshot of the ring buffer (list copy, newest last).
 
-        Each entry is a StampedSample(arrival_ns, sample) where arrival_ns
-        is CLOCK_MONOTONIC nanoseconds recorded when the frame arrived from
-        the USB host controller.  DualCameraManager uses these timestamps
-        to match frames across cameras — same-trigger frames arrive within
-        ~2 ms of each other regardless of trigger rate.
+        Each entry is a StampedSample(timestamp_ns, sample) where timestamp_ns
+        is the v4l2 kernel CLOCK_MONOTONIC timestamp (buffer.pts + base_time),
+        or a wall-clock fallback if PTS is unavailable.  DualCameraManager
+        uses these timestamps to match frames across cameras — same-trigger
+        frames have kernel timestamps within ~1 ms.
         """
         with self._sample_lock:
             return list(self._sample_ring)
