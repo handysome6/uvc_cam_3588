@@ -191,7 +191,7 @@ A millisecond timer with ~75ms display refresh cannot detect off-by-1 frame desy
 
 ## Timestamp Diagnostic Tool
 
-The codebase includes a diagnostic mode for embedding v4l2 timestamps into captured filenames:
+The codebase includes a diagnostic mode for embedding pad-probe timestamps into captured filenames:
 
 ```bash
 # Enable via CLI flag
@@ -202,18 +202,70 @@ python main.py --pts-filename
 
 Filename format with timestamps enabled:
 ```
-A_20260410_122411_481_ts6495977030084.jpg
-D_20260410_122411_481_ts6495901736958.jpg
+A_20260413_112420_574_ts158485496717102.jpg
+D_20260413_112420_574_ts158485480949882.jpg
                       ^^^^^^^^^^^^^^^^^^^
-                      absolute v4l2 CLOCK_MONOTONIC timestamp (nanoseconds)
+                      pad-probe CLOCK_MONOTONIC timestamp (nanoseconds)
 ```
 
-**Note**: Timestamps are only reliable when the actual trigger rate matches the negotiated GStreamer caps framerate (e.g., 27Hz trigger with `framerate=55/2`). At mismatched rates (e.g., 10Hz trigger with 27.5fps caps), timestamps are synthetic and unusable for sync comparison.
+These timestamps are the same values used by the frame matcher — stamped on v4l2src's streaming thread before the tee fans out. Same-trigger frames show deltas under ~1ms.
 
-## Pending Fix
+## Implemented Fix: Ring Buffer + Pad-Probe Timestamp Matching
 
-The root cause -- `_latest_sample` being a single-slot cache with no frame identity -- requires a frame-matching mechanism. Potential approaches:
+### Approach
 
-1. **Ring buffer with timestamp matching**: Cache the last N samples with their v4l2 timestamps. On capture, find the pair with closest timestamps from both cameras.
-2. **Wall-clock stamping in callback**: Record `time.clock_gettime(CLOCK_MONOTONIC)` in `_on_new_capture_sample()` when each frame arrives, bypassing GStreamer's timestamp processing entirely.
-3. **Match negotiated framerate to trigger rate**: Change caps to match the actual trigger frequency so v4l2src produces real timestamps, then use timestamp comparison to select matching frames.
+Replaced the single-slot `_latest_sample` cache with a ring buffer of 5 recent frames, each tagged with a CLOCK_MONOTONIC timestamp. On capture, both cameras' ring buffers are snapshot and the pair with minimum timestamp delta is selected.
+
+### Implementation
+
+**`camera_pipeline.py`:**
+- `StampedSample(timestamp_ns, sample)` NamedTuple pairs a timestamp with each GStreamer sample
+- `_sample_ring: deque[StampedSample]` (maxlen=5) replaces `_latest_sample`
+- `_stamp_probe()` pad probe on the tee's sink pad stamps `clock_gettime_ns(CLOCK_MONOTONIC)` on v4l2src's streaming thread, stored in a side-channel dict keyed by `buffer.pts`
+- `_on_new_capture_sample()` looks up the probe timestamp by PTS to tag each ring entry
+- `snapshot_ring()` returns an atomic list copy for matching
+- Preview queue is `leaky=downstream max-size-buffers=2` to prevent backpressure from blocking v4l2src's thread
+
+**`dual_camera_manager.py`:**
+- `capture()` Phase 1: snapshot both rings
+- `capture()` Phase 2: O(N²) search for minimum `|a.timestamp_ns - d.timestamp_ns|` (N=5, trivial cost)
+- Phases 3-4: write matched pair to disk
+
+### Timestamp Source: Three Iterations
+
+**Iteration 1 — Wall-clock in appsink callback (commit 5c0d353):**
+
+Stamped frames with `time.clock_gettime_ns(CLOCK_MONOTONIC)` inside the appsink callback. This worked perfectly in headless mode (no preview decode, <1ms jitter), but **failed ~50% in the GUI** because mppjpegdec + videoconvert preview threads cause >18ms of CPU scheduling jitter on the capture callback. At 27Hz (36ms frame interval), jitter exceeding half the interval causes the matcher to select the wrong frame.
+
+**Iteration 2 — v4l2 kernel timestamp (commit 05980e9):**
+
+Changed to `buffer.pts + pipeline.get_base_time()`, which recovers the original v4l2 kernel CLOCK_MONOTONIC timestamp. Kernel timestamps are stamped in driver space, immune to userspace thread scheduling. Achieved 100% sync in GUI mode. However, this relies on undocumented `v4l2src` internals — `pts + base_time` only equals the real kernel timestamp when actual FPS matches negotiated FPS, and breaks under pipeline restart or caps renegotiation. See `docs/frame-sync-future-directions.md` for the full fragility analysis.
+
+**Iteration 3 — Pad probe wall-clock (current):**
+
+Attached a `BUFFER` pad probe on the tee's sink pad. The probe stamps `clock_gettime_ns(CLOCK_MONOTONIC)` and stores it in a dict keyed by `buffer.pts`. The appsink callback looks up the probe timestamp by PTS.
+
+The probe runs on v4l2src's streaming thread, **before** the tee fans out to preview/capture branches — no preview decode contention at this point. A critical requirement is that the preview queue must be **leaky** (`leaky=downstream`); otherwise backpressure from mppjpegdec blocks v4l2src's thread and reintroduces the same jitter. Initial testing without the leaky queue showed 9/20 desync; adding `leaky=downstream` restored 20/20 sync.
+
+### Test Results
+
+| Test | Method | Sync Rate | Match Delta |
+|------|--------|-----------|-------------|
+| Headless (freerun ~10fps) | Wall-clock appsink | 20/20 (100%) | ~0.5ms mean |
+| GUI (27Hz trigger) | Wall-clock appsink | 9/20 (45%) | wrong pairs ~35ms |
+| GUI (27Hz trigger) | v4l2 kernel ts | 20/20 (100%) | ~1.9ms mean |
+| GUI (27Hz trigger) | Pad probe (non-leaky queue) | 11/20 (55%) | wrong pairs ~35ms |
+| GUI (27Hz trigger) | Pad probe + leaky queue | 20/20 (100%) | ~0.9ms mean |
+| GUI (27Hz trigger, run 2) | Pad probe + leaky queue | 20/20 (100%) | ~0.9ms mean |
+
+### Why Pad Probe Over v4l2 Kernel Timestamp
+
+The v4l2 kernel timestamp approach (`buffer.pts + base_time`) achieved 100% sync but relied on undocumented `v4l2src` implementation behavior:
+
+1. `pts + base_time = kernel_timestamp` is not a GStreamer API contract
+2. Synthetic PTS when actual FPS mismatches negotiated caps FPS
+3. `base_time` resets on pipeline restart, corrupting the first few frames
+4. Caps renegotiation can break PTS continuity
+5. Making the preview queue leaky (needed for the probe approach) also causes v4l2src to switch to synthetic PTS — confirmed by the probe_leaky test runs where `pts + base_time` deltas jumped to seconds
+
+The pad probe approach eliminates all these dependencies. Wall-clock is stamped in Python on the correct thread (v4l2src's, before decode contention), with no dependency on GStreamer's internal PTS computation, base_time, or pipeline state.

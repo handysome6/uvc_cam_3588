@@ -126,12 +126,12 @@ class DualCameraManager(QObject):
             if pipe is not None:
                 rings[canvas_pos] = pipe.snapshot_ring()
 
-        # Phase 2: match frames by closest v4l2 kernel timestamp
+        # Phase 2: match frames by closest pad-probe timestamp
         #
-        # Each ring entry carries a CLOCK_MONOTONIC timestamp — preferably
-        # the v4l2 kernel timestamp (buffer.pts + base_time) which is immune
-        # to userspace scheduling jitter.  Same-trigger frames have kernel
-        # timestamps within ~1 ms regardless of GStreamer thread scheduling.
+        # Each ring entry carries a CLOCK_MONOTONIC timestamp stamped by a
+        # pad probe on v4l2src's streaming thread (before the tee fans out
+        # to preview/capture branches).  No preview decode contention at
+        # this point, so same-trigger frames have timestamps within ~1 ms.
         samples: list[Gst.Sample | None] = [None, None]
         match_delta_ms: float | None = None
 

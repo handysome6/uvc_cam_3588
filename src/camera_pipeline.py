@@ -159,12 +159,14 @@ class StampedSample(NamedTuple):
     """A GStreamer sample tagged with a CLOCK_MONOTONIC timestamp for matching.
 
     timestamp_ns is the best available CLOCK_MONOTONIC time for this frame:
-      - Preferred: v4l2 kernel timestamp (buffer.pts + pipeline.base_time),
-        stamped in kernel space, immune to userspace scheduling jitter.
-      - Fallback:  wall-clock arrival time (time.clock_gettime_ns), used only
-        when PTS is unavailable (CLOCK_TIME_NONE).
+      - Preferred: pad-probe wall-clock (time.clock_gettime_ns stamped on
+        v4l2src's streaming thread, before the tee fans out to preview/capture
+        branches).  Immune to preview decode contention and independent of
+        GStreamer base_time / PTS computation internals.
+      - Fallback:  wall-clock at appsink callback time, used only when the
+        probe timestamp lookup fails (e.g. PTS is CLOCK_TIME_NONE).
     """
-    timestamp_ns: int     # CLOCK_MONOTONIC ns — v4l2 kernel ts preferred
+    timestamp_ns: int     # CLOCK_MONOTONIC ns — pad-probe wall-clock preferred
     sample: object        # Gst.Sample (typed as object for NamedTuple compat)
 
 
@@ -250,9 +252,17 @@ class CameraPipeline(QObject):
 
         # Ring buffer of recent MJPEG samples — updated on GStreamer streaming thread.
         # Each entry is a StampedSample(timestamp_ns, sample) so that
-        # DualCameraManager can match frames across cameras by v4l2 kernel timestamp.
+        # DualCameraManager can match frames across cameras by pad-probe timestamp.
         self._sample_ring: deque[StampedSample] = deque(maxlen=RING_BUFFER_SIZE)
         self._sample_lock = threading.Lock()
+
+        # Pad-probe timestamp side channel: maps buffer PTS → wall-clock ns.
+        # The probe fires on the tee's sink pad (v4l2src streaming thread,
+        # before preview decode contention).  The appsink callback looks up
+        # the probe timestamp by the buffer's PTS to get a jitter-free,
+        # base_time-independent CLOCK_MONOTONIC timestamp.
+        self._probe_timestamps: dict[int, int] = {}
+        self._probe_lock = threading.Lock()
 
         # State: "stopped" | "playing" | "error"
         self._state = "stopped"
@@ -284,15 +294,21 @@ class CameraPipeline(QObject):
             )
             if self._use_overlay:
                 # HW decode + resize -> VideoOverlay sink (xvimagesink)
+                # Preview queue must be leaky to prevent backpressure from
+                # mppjpegdec blocking v4l2src's thread — that would add
+                # variable jitter to the pad-probe timestamps used for
+                # cross-camera frame matching.
                 preview_branch = (
-                    f"t. ! queue ! jpegparse name=parser ! "
+                    f"t. ! queue leaky=downstream max-size-buffers=2 ! "
+                    f"jpegparse name=parser ! "
                     f"mppjpegdec width={W} height={H} format=NV12 ! "
                     "xvimagesink name=preview_sink sync=false "
                 )
             else:
                 # HW decode + resize -> RGB -> appsink (CPU copy for QImage)
                 preview_branch = (
-                    f"t. ! queue ! jpegparse name=parser ! "
+                    f"t. ! queue leaky=downstream max-size-buffers=2 ! "
+                    f"jpegparse name=parser ! "
                     f"mppjpegdec width={W} height={H} ! "
                     f"videoconvert ! video/x-raw,format=RGB,width={W},height={H} ! "
                     "appsink name=preview_sink drop=true max-buffers=1 "
@@ -312,13 +328,15 @@ class CameraPipeline(QObject):
             )
             if self._use_overlay:
                 preview_branch = (
-                    f"t. ! queue ! jpegdec ! videoconvert ! "
+                    f"t. ! queue leaky=downstream max-size-buffers=2 ! "
+                    f"jpegdec ! videoconvert ! "
                     f"video/x-raw,width={W},height={H} ! "
                     "autovideosink name=preview_sink sync=false "
                 )
             else:
                 preview_branch = (
-                    f"t. ! queue ! jpegdec ! videoconvert ! "
+                    f"t. ! queue leaky=downstream max-size-buffers=2 ! "
+                    f"jpegdec ! videoconvert ! "
                     f"video/x-raw,format=RGB,width={W},height={H} ! "
                     "appsink name=preview_sink drop=true max-buffers=1 "
                     "emit-signals=true sync=false "
@@ -386,6 +404,18 @@ class CameraPipeline(QObject):
                 )
                 logger.info("JPEG validation probe attached | device={}", self._device)
 
+        # Attach timestamp probe on tee's sink pad.
+        # This runs on v4l2src's streaming thread (before the tee fans out
+        # to preview/capture branches), so wall-clock stamps here have
+        # sub-ms accuracy with no preview decode contention.
+        tee = self._pipeline.get_by_name("t")
+        if tee is not None:
+            tee_sink_pad = tee.get_static_pad("sink")
+            tee_sink_pad.add_probe(
+                Gst.PadProbeType.BUFFER, self._stamp_probe,
+            )
+            logger.info("Timestamp probe attached on tee sink pad | device={}", self._device)
+
         # Connect capture appsink new-sample
         self._capture_sink.connect("new-sample", self._on_new_capture_sample)
 
@@ -442,26 +472,56 @@ class CameraPipeline(QObject):
         self._capture_sink = None
         with self._sample_lock:
             self._sample_ring.clear()
+        with self._probe_lock:
+            self._probe_timestamps.clear()
         self._state = "stopped"
         QThreadPool.globalInstance().waitForDone(2000)
         logger.info("Pipeline stopped")
 
     # ------------------------------------------------------------------
-    # Capture appsink callback — GStreamer streaming thread
+    # Pad probe — v4l2src streaming thread (before tee fan-out)
+    # ------------------------------------------------------------------
+
+    def _stamp_probe(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        """Record wall-clock timestamp for each buffer, keyed by PTS.
+
+        Runs on v4l2src's streaming thread (the tee's sink pad), before the
+        buffer is pushed to preview/capture branches.  No preview decode
+        contention at this point, so wall-clock accuracy is sub-ms.
+        """
+        buf = info.get_buffer()
+        if buf is not None:
+            pts = buf.pts
+            if pts != Gst.CLOCK_TIME_NONE:
+                ts = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+                with self._probe_lock:
+                    self._probe_timestamps[pts] = ts
+                    # Prevent unbounded growth from frames dropped by the
+                    # leaky capture queue (never consumed by appsink).
+                    if len(self._probe_timestamps) > 50:
+                        keys = list(self._probe_timestamps.keys())
+                        for k in keys[:25]:
+                            del self._probe_timestamps[k]
+        return Gst.PadProbeReturn.OK
+
+    # ------------------------------------------------------------------
+    # Capture appsink callback — capture branch streaming thread
     # ------------------------------------------------------------------
 
     def _on_new_capture_sample(self, appsink: Gst.Element) -> Gst.FlowReturn:
-        """Cache MJPEG sample with v4l2 kernel timestamp; called on GStreamer streaming thread."""
+        """Cache MJPEG sample with pad-probe timestamp; called on capture streaming thread."""
         sample = appsink.emit("pull-sample")
         if sample is not None:
             buf = sample.get_buffer()
             pts = buf.pts
-            # Prefer v4l2 kernel timestamp (CLOCK_MONOTONIC, stamped in kernel,
-            # immune to userspace scheduling jitter from preview decode threads).
-            # Fall back to wall-clock only if PTS is unavailable.
-            if pts != Gst.CLOCK_TIME_NONE and self._pipeline is not None:
-                ts = pts + self._pipeline.get_base_time()
-            else:
+            ts = None
+            # Look up the probe timestamp (stamped on v4l2src's thread,
+            # before decode contention, no base_time dependency).
+            if pts != Gst.CLOCK_TIME_NONE:
+                with self._probe_lock:
+                    ts = self._probe_timestamps.pop(pts, None)
+            # Fall back to wall-clock if probe lookup fails.
+            if ts is None:
                 ts = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
             with self._sample_lock:
                 self._sample_ring.append(StampedSample(ts, sample))
@@ -590,10 +650,11 @@ class CameraPipeline(QObject):
         """Return a snapshot of the ring buffer (list copy, newest last).
 
         Each entry is a StampedSample(timestamp_ns, sample) where timestamp_ns
-        is the v4l2 kernel CLOCK_MONOTONIC timestamp (buffer.pts + base_time),
-        or a wall-clock fallback if PTS is unavailable.  DualCameraManager
-        uses these timestamps to match frames across cameras — same-trigger
-        frames have kernel timestamps within ~1 ms.
+        is the pad-probe wall-clock CLOCK_MONOTONIC timestamp (stamped on
+        v4l2src's streaming thread before the tee), or a wall-clock fallback
+        at appsink time if the probe lookup failed.  DualCameraManager uses
+        these timestamps to match frames across cameras — same-trigger frames
+        have probe timestamps within ~1 ms.
         """
         with self._sample_lock:
             return list(self._sample_ring)

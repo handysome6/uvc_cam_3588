@@ -57,6 +57,8 @@ class HeadlessCaptureSource:
         self._pipeline: Gst.Pipeline | None = None
         self._sample_ring: deque[StampedSample] = deque(maxlen=RING_BUFFER_SIZE)
         self._lock = threading.Lock()
+        self._probe_timestamps: dict[int, int] = {}
+        self._probe_lock = threading.Lock()
         self._frame_count = 0
         self._error: str | None = None
 
@@ -64,7 +66,7 @@ class HeadlessCaptureSource:
         pipe_str = (
             f"v4l2src device={self.device} io-mode=mmap ! "
             f"image/jpeg,width=5120,height=3840,framerate={self.framerate} ! "
-            "queue leaky=downstream max-size-buffers=1 ! "
+            "queue name=q leaky=downstream max-size-buffers=1 ! "
             "appsink name=sink drop=true max-buffers=1 emit-signals=true"
         )
         logger.info("[{}] Pipeline: {}", self.device, pipe_str)
@@ -78,6 +80,13 @@ class HeadlessCaptureSource:
 
         sink = self._pipeline.get_by_name("sink")
         sink.connect("new-sample", self._on_sample)
+
+        # Attach timestamp probe on queue's sink pad (v4l2src thread)
+        q = self._pipeline.get_by_name("q")
+        if q is not None:
+            q_sink = q.get_static_pad("sink")
+            q_sink.add_probe(Gst.PadProbeType.BUFFER, self._stamp_probe)
+            logger.info("[{}] Timestamp probe attached on queue sink pad", self.device)
 
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
@@ -103,7 +112,24 @@ class HeadlessCaptureSource:
             self._pipeline = None
         with self._lock:
             self._sample_ring.clear()
+        with self._probe_lock:
+            self._probe_timestamps.clear()
         logger.info("[{}] Stopped ({} frames received)", self.device, self._frame_count)
+
+    def _stamp_probe(self, pad, info) -> Gst.PadProbeReturn:
+        """Record wall-clock timestamp keyed by PTS on v4l2src's thread."""
+        buf = info.get_buffer()
+        if buf is not None:
+            pts = buf.pts
+            if pts != Gst.CLOCK_TIME_NONE:
+                ts = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+                with self._probe_lock:
+                    self._probe_timestamps[pts] = ts
+                    if len(self._probe_timestamps) > 50:
+                        keys = list(self._probe_timestamps.keys())
+                        for k in keys[:25]:
+                            del self._probe_timestamps[k]
+        return Gst.PadProbeReturn.OK
 
     def _on_sample(self, appsink) -> Gst.FlowReturn:
         sample = appsink.emit("pull-sample")
@@ -111,9 +137,11 @@ class HeadlessCaptureSource:
             return Gst.FlowReturn.OK
         buf = sample.get_buffer()
         pts = buf.pts
-        if pts != Gst.CLOCK_TIME_NONE and self._pipeline is not None:
-            ts = pts + self._pipeline.get_base_time()
-        else:
+        ts = None
+        if pts != Gst.CLOCK_TIME_NONE:
+            with self._probe_lock:
+                ts = self._probe_timestamps.pop(pts, None)
+        if ts is None:
             ts = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
         self._frame_count += 1
         with self._lock:
